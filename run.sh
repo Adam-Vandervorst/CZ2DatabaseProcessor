@@ -1,0 +1,1 @@
+/usr/lib/jvm/java-17-openjdk/bin/java -server -Dsbt.supershell=false -Xmx32G -Didea.managed=true -Dfile.encoding=UTF-8 -Didea.installation.dir=/home/adam/.local/share/JetBrains/Toolbox/apps/intellij-idea-ultimate -jar /home/adam/.local/share/JetBrains/IntelliJIdea2023.3/Scala/launcher/sbt-launch.jar
