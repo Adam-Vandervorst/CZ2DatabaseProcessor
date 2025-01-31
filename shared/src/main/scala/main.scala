@@ -14,15 +14,15 @@ object DataParser extends Parser:
   val floats = RangeStorage[Float](2 << 24, 2 << 27)
   val strings = RangeStorage[String](2 << 27, 2 << 29)
 
-  override def tokenizer(s: String): Option[Expr] =
-    if s.head == '"' then Some(strings.addV(s))
-    else if !s.head.isDigit then Some(symbols.addV(s))
-    else Some(floats.addV(s.toFloat))
+  override def tokenizer(s: String): Expr =
+    if s.head == '"' then strings.addV(s)
+    else if !s.head.isDigit then symbols.addV(s)
+    else floats.addV(s.toFloat)
 
 
 @main def example =
 //  val lines = 67458171
-  val lines = 1000000
+  val lines = 50_000
 
   // TWO STEP
   val result = ArrayBuffer.fill[Expr](lines)(null)
