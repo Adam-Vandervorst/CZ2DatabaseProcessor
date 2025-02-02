@@ -1,9 +1,5 @@
 import be.adamv.cz2.*
-
-import java.io.{File, FileWriter}
-import scala.collection.mutable.ArrayBuffer
-import scala.io.Source
-import scala.util.Using
+import cask.*
 
 
 object DataParser extends Parser:
@@ -19,92 +15,141 @@ object DataParser extends Parser:
     else if !s.head.isDigit then symbols.addV(s)
     else floats.addV(s.toFloat)
 
+object DataPrinter extends Printer:
+  val newVarString: String = "◆"
+  def preVarString(x: Long): String = "⏴" + subscript(-x.toInt)
+  def freeVarString(x: Long): String =
+    DataParser.symbols.get(x.toInt)
+      .orElse(DataParser.symbols.get(x.toInt))
+      .orElse(DataParser.floats.get(x.toInt).map(_.toString))
+      .orElse(DataParser.strings.get(x.toInt))
+      .getOrElse(x.toString)
+  val exprSep: String = " "
+  val exprOpen: String = "("
+  val exprClose: String = ")"
 
-@main def example =
-//  val lines = 67458171
-  val lines = 50_000
+def parse_space(s: Iterable[Char]): ExprMap[Unit] =
+  val result = ExprMap[Unit]()
+  val it = s.iterator.buffered
+  var last = DataParser.sexprUnsafe(it)
+  while last ne null do
+    result.update(last, ())
+    last = DataParser.sexprUnsafe(it)
+  result
 
-  // TWO STEP
-  val result = ArrayBuffer.fill[Expr](lines)(null)
+def stringify_space(em: EM[_]): String =
+  em.keys.map(DataPrinter.sexpression(_, 0, false)).mkString("\n")
 
-  println("Parsing...")
-  val t0 = System.nanoTime()
+def parse_path(s: String): Iterable[Option[Int]] =
+  s.split('.').flatMap(x => Array(None, Some(DataParser.tokenizer(x).leftMost)))
 
-  Using(Source.fromFile(f"resources/edges$lines.metta"))(it =>
-    val bit = it.buffered
-    var last = DataParser.sexpr(bit)
-    for i <- 0 until lines do
-      val res = last.orNull
-      if res == null then
-        println(f"error occurred at $i")
-      else
-        result(i) = res
-      if i % 10000 == 0 then println(i)
-      last = DataParser.sexpr(bit)
-  ).get
+object Server extends cask.MainRoutes {
+  var space = ExprMap[Unit]()
+  override def port: Int = 8081
 
-  println(f"Parsing took ${(System.nanoTime() - t0)/1e6} ms")
-  println("Loading...")
-  val t1 = System.nanoTime()
+  @cask.post("/import/:destination")
+  def importFile(request: cask.Request, destination: String) = {
+    val write_path = parse_path(destination)
+    val subspace = parse_space(request.text())
+//    println(s"request destination ${destination} (${write_path.mkString("::")}::Nil)")
+//    println("parsed")
+//    println(subspace.prettyListing())
+    space.setAt(write_path, subspace.em, ???)
+//    println(s"and wrote it to path ${destination}")
+  }
 
-  val em = ExprMap[Unit]()
+  @cask.get("/export/:source")
+  def exportFile(request: cask.Request, source: String) = {
+    val read_path = parse_path(source)
+    space.getAt(read_path) match
+      case Left(em) =>
+//        println(s"read from path ${source}")
+        val result = stringify_space(em)
+//        println("and serialized it")
+//        println(result)
+        result
+      case Right(v) => v.toString
+  }
 
-  for i <- 0 until lines do
-    em.update(result(i), ())
+  @cask.post("/transform/:source/:destination")
+  def transform(request: cask.Request, source: String, destination: String) = {
+    val read_path = parse_path(source)
+    val write_path = parse_path(destination)
+    val App(pattern, template) = DataParser.sexpr(request.text().iterator).get: @unchecked
 
-  println(f"Loading took ${(System.nanoTime() - t1)/1e6} ms")
+    space.getAt(read_path) match
+      case Left(em) =>
+        val transformed_subspace = em.transform(pattern, template)
+        space.setAt(write_path, transformed_subspace.em, ???)
+      case Right(v) =>
+        space.setAt(write_path, ???, v)
+  }
 
-  // SINGLE STEP
-  /*println("Loading and parsing...")
-  val t1 = System.nanoTime()
+  @cask.get("/union_into/:left/:right/:destination")
+  def unionInto(request: cask.Request, left: String, right: String, destination: String) = {
+    val read_left_path = parse_path(left)
+    val read_right_path = parse_path(right)
+    val write_path = parse_path(destination)
+    space.getAt(read_left_path) match
+      case Left(em) => space.getAt(read_right_path) match
+        case Left(oem) =>
+          space.setAt(write_path, em.union(oem.asInstanceOf), ???)
+        case Right(ov) => ()
+      case Right(v) => ()
+  }
 
-  val em = ExprMap[Unit]()
+  @cask.get("/intersection_into/:left/:right/:destination")
+  def intersectionInto(request: cask.Request, left: String, right: String, destination: String) = {
+    val read_left_path = parse_path(left)
+    val read_right_path = parse_path(right)
+    val write_path = parse_path(destination)
+    space.getAt(read_left_path) match
+      case Left(em) => space.getAt(read_right_path) match
+        case Left(oem) =>
+          space.setAt(write_path, em.intersection(oem.asInstanceOf).em, ???)
+        case Right(ov) => ()
+      case Right(v) => ()
+  }
 
-  Using(Source.fromFile(f"resources/edges$lines.metta"))(it =>
-    val bit = it.buffered
-    var last = DataParser.sexpr(bit)
-    for i <- 0 until lines do
-      val res = last.orNull
-      if res == null then
-        println(f"error occurred at $i")
-      else
-        em.update(res, ())
-      if i % 10000 == 0 then println(i)
-      last = DataParser.sexpr(bit)
-  ).get
+  @cask.get("/subtraction_from/:left/:right/:destination")
+  def subtractionFrom(request: cask.Request, left: String, right: String, destination: String) = {
+    val read_left_path = parse_path(left)
+    val read_right_path = parse_path(right)
+    val write_path = parse_path(destination)
+    space.getAt(read_left_path) match
+      case Left(em) => space.getAt(read_right_path) match
+        case Left(oem) =>
+          space.setAt(write_path, oem.subtract(em.asInstanceOf).em, ???)
+        case Right(ov) => ()
+      case Right(v) => ()
+  }
 
-  println(f"Parsing and loading took ${(System.nanoTime() - t1)/1e6} ms")*/
+  @cask.get("/stop/")
+  def stopServer(request: Request) = {
+    val s = space.size
+    actorContext.future(System.exit(0))
+    f"contained $s atoms\n"
+  }
 
+  initialize()
+}
 
-  println("Dumping...")
-  val t2 = System.nanoTime()
-  val dump = em.prettyListing(false)
-  println(f"Dumping took ${(System.nanoTime() - t2) / 1e6} ms")
-  println("Serializing...")
-  val t3 = System.nanoTime()
-  val serial = em.prettyStructuredSet(false)
-  println(f"Serializing took ${(System.nanoTime() - t3) / 1e6} ms")
+/*
+publishing cz2 (https://github.com/Adam-Vandervorst/CZ2):
+sbt> project root
+sbt> publishLocal
 
-  val plain_file = new FileWriter(new File(f"resources/plain_edges$lines.metta"))
-  plain_file.write(dump)
-  plain_file.close()
+starting server (this repo):
+sbt> project root
+sbt> run
 
-  val serial_file = new FileWriter(new File(f"resources/serial_edges$lines.metta"))
-  serial_file.write(serial)
-  serial_file.close()
-
-  val symbol_values_file = new FileWriter(new File(f"resources/symbol_values$lines.metta"))
-  val symbol_range = DataParser.symbols.start until (DataParser.symbols.start + DataParser.symbols.occupied)
-  val symbols = symbol_range.map(DataParser.symbols.indexToValue).mkString("\n")
-  symbol_values_file.write(symbols)
-  symbol_values_file.close()
-  val float_values_file = new FileWriter(new File(f"resources/float_values$lines.metta"))
-  val float_range = DataParser.floats.start until (DataParser.floats.start + DataParser.floats.occupied)
-  val floats = float_range.map(DataParser.floats.indexToValue).mkString("\n")
-  float_values_file.write(floats)
-  float_values_file.close()
-  val string_values_file = new FileWriter(new File(f"resources/string_values$lines.metta"))
-  val string_range = DataParser.strings.start until (DataParser.strings.start + DataParser.strings.occupied)
-  val strings = string_range.map(DataParser.strings.indexToValue).mkString("\n")
-  string_values_file.write(strings)
-  string_values_file.close()
+testing API (when located in https://github.com/trueagi-io/metta-examples/tree/main/aunt-kg):
+curl -i -X POST localhost:8081/import/aunt-kg.toy -d "@toy.metta"
+curl localhost:8081/export/aunt-kg.toy
+curl -i -X POST localhost:8081/import/aunt-kg.simpsons -d "@simpsons_simple.metta"
+curl -i -X POST localhost:8081/import/aunt-kg.lotr -d "@lordOfTheRings_simple.metta"
+curl localhost:8081/union_into/aunt-kg.lotr/aunt-kg.simpsons/genealogy.merged
+curl localhost:8081/union_into/aunt-kg.toy/genealogy.merged/genealogy.merged
+curl localhost:8081/export/genealogy.merged
+curl localhost:8081/stop
+*/
