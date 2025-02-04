@@ -1,14 +1,16 @@
 import be.adamv.cz2.*
 import cask.*
 
+import scala.collection.mutable.ArrayBuffer
+
 
 object DataParser extends Parser:
   override val empty: Int = 1
   override val singleton: Int = 2
 
-  val symbols = RangeStorage[String](3, 100)
-  val floats = RangeStorage[Float](2 << 24, 2 << 27)
-  val strings = RangeStorage[String](2 << 27, 2 << 29)
+  val symbols = ParRangeStorage[String](3, 2 << 24)
+  val floats = ParRangeStorage[Float](2 << 24, 2 << 27)
+  val strings = ParRangeStorage[String](2 << 27, 2 << 29)
 
   override def tokenizer(s: String): Expr =
     if s.head == '"' then strings.addV(s)
@@ -40,96 +42,130 @@ def parse_space(s: Iterable[Char]): ExprMap[Unit] =
 def stringify_space(em: EM[_]): String =
   em.keys.map(DataPrinter.sexpression(_, 0, false)).mkString("\n")
 
-def parse_path(s: String): Iterable[Option[Int]] =
+def parse_path(s: String): Seq[Option[Int]] =
   s.split('.').flatMap(x => Array(None, Some(DataParser.tokenizer(x).leftMost)))
 
 object Server extends cask.MainRoutes {
-  var space = ExprMap[Unit]()
+  private val space = ExprMap[Unit]()
   override def port: Int = 8081
 
+  private val registry_lock = java.util.concurrent.locks.ReentrantLock()
+  private val registry = ArrayBuffer[(Long, Seq[Option[Int]], Boolean)]()
+  def register(id: Long, actions: (Seq[Option[Int]], Boolean)*): Boolean =
+    registry_lock.lock()
+    try
+      var possible = true
+      for case (_, rp, rw) <- registry; case (ap, aw) <- actions do
+        println(f"$rp, $ap, ${!ap.startsWith(rp)}")
+        if rw || aw then possible &= !ap.startsWith(rp)
+      println(s"possible ${possible} (registry: ${registry.mkString(";")}, requested: ${actions.mkString(";")})")
+      if possible then registry.appendAll(actions.map((id, _, _)))
+      possible
+    finally registry_lock.unlock()
+  def unregister(id: Long): Unit =
+    registry_lock.lock()
+    try
+      registry.filterInPlace((aid, p, w) => if aid != id then true else { println(f"cleared $p $w"); false })
+    finally registry_lock.unlock()
+  inline def locked[A](inline actions: (Seq[Option[Int]], Boolean)*)(inline body: => A): String =
+    val tid = Thread.currentThread().threadId()
+    if register(tid, actions*) then
+      try body.toString
+      finally unregister(tid)
+    else
+      "conflicting reads at path"
+
   @cask.post("/import/:destination")
-  def importFile(request: cask.Request, destination: String) = {
+  def importFile(request: cask.Request, destination: String) =
     val write_path = parse_path(destination)
     val subspace = parse_space(request.text())
-//    println(s"request destination ${destination} (${write_path.mkString("::")}::Nil)")
+    println(s"request destination ${destination} (${write_path.mkString("::")}::Nil) ${write_path.map(_.map(DataPrinter.freeVarString(_)))}")
+    val s = subspace.size
 //    println("parsed")
 //    println(subspace.prettyListing())
-    space.setAt(write_path, subspace.em, ???)
-//    println(s"and wrote it to path ${destination}")
-  }
+    locked(write_path -> true) {
+      space.setAt(write_path, subspace.em, ???)
+      println(s"and wrote ${s} to path ${destination}")
+    }
 
   @cask.get("/export/:source")
-  def exportFile(request: cask.Request, source: String) = {
+  def exportFile(request: cask.Request, source: String) =
     val read_path = parse_path(source)
-    space.getAt(read_path) match
-      case Left(em) =>
-//        println(s"read from path ${source}")
-        val result = stringify_space(em)
-//        println("and serialized it")
-//        println(result)
-        result
-      case Right(v) => v.toString
-  }
+    locked(read_path -> false) {
+      space.getAt(read_path) match
+        case Left(em) =>
+          println(s"read from path ${source}")
+          val s = em.size
+          val result = stringify_space(em)
+          println(s"and serialized ${s}")
+          //        println(result)
+          result
+        case Right(v) => v.toString
+    }
 
   @cask.post("/transform/:source/:destination")
-  def transform(request: cask.Request, source: String, destination: String) = {
+  def transform(request: cask.Request, source: String, destination: String) =
     val read_path = parse_path(source)
     val write_path = parse_path(destination)
     val App(pattern, template) = DataParser.sexpr(request.text().iterator).get: @unchecked
 
-    space.getAt(read_path) match
-      case Left(em) =>
-        val transformed_subspace = em.transform(pattern, template)
-        space.setAt(write_path, transformed_subspace.em, ???)
-      case Right(v) =>
-        space.setAt(write_path, ???, v)
-  }
+    locked(read_path -> false, write_path -> true) {
+      space.getAt(read_path) match
+        case Left(em) =>
+          space.setAt(write_path, em.transform(pattern, template).em, ???)
+        case Right(v) =>
+          space.setAt(write_path, ???, v)
+    }
 
   @cask.get("/union_into/:left/:right/:destination")
-  def unionInto(request: cask.Request, left: String, right: String, destination: String) = {
+  def unionInto(request: cask.Request, left: String, right: String, destination: String) =
     val read_left_path = parse_path(left)
     val read_right_path = parse_path(right)
     val write_path = parse_path(destination)
-    space.getAt(read_left_path) match
-      case Left(em) => space.getAt(read_right_path) match
-        case Left(oem) =>
-          space.setAt(write_path, em.union(oem.asInstanceOf), ???)
-        case Right(ov) => ()
-      case Right(v) => ()
-  }
+    locked(read_left_path -> false, read_right_path -> false, write_path -> true) {
+      space.getAt(read_left_path) match
+        case Left(em) =>
+          space.getAt(read_right_path) match
+            case Left(oem) =>
+              space.setAt(write_path, em.union(oem.asInstanceOf), ???)
+            case Right(ov) => ()
+        case Right(v) => ()
+    }
 
   @cask.get("/intersection_into/:left/:right/:destination")
-  def intersectionInto(request: cask.Request, left: String, right: String, destination: String) = {
+  def intersectionInto(request: cask.Request, left: String, right: String, destination: String) =
     val read_left_path = parse_path(left)
     val read_right_path = parse_path(right)
     val write_path = parse_path(destination)
-    space.getAt(read_left_path) match
-      case Left(em) => space.getAt(read_right_path) match
-        case Left(oem) =>
-          space.setAt(write_path, em.intersection(oem.asInstanceOf).em, ???)
-        case Right(ov) => ()
-      case Right(v) => ()
-  }
+    locked(read_left_path -> false, read_right_path -> false, write_path -> true) {
+      space.getAt(read_left_path) match
+        case Left(em) => space.getAt(read_right_path) match
+          case Left(oem) =>
+            space.setAt(write_path, em.intersection(oem.asInstanceOf).em, ???)
+          case Right(ov) => ()
+        case Right(v) => ()
+    }
 
   @cask.get("/subtraction_from/:left/:right/:destination")
-  def subtractionFrom(request: cask.Request, left: String, right: String, destination: String) = {
+  def subtractionFrom(request: cask.Request, left: String, right: String, destination: String) =
     val read_left_path = parse_path(left)
     val read_right_path = parse_path(right)
     val write_path = parse_path(destination)
-    space.getAt(read_left_path) match
-      case Left(em) => space.getAt(read_right_path) match
-        case Left(oem) =>
-          space.setAt(write_path, oem.subtract(em.asInstanceOf).em, ???)
-        case Right(ov) => ()
-      case Right(v) => ()
-  }
+    locked(read_left_path -> false, read_right_path -> false, write_path -> true) {
+      space.getAt(read_left_path) match
+        case Left(em) => space.getAt(read_right_path) match
+          case Left(oem) =>
+            space.setAt(write_path, oem.subtract(em.asInstanceOf).em, ???)
+          case Right(ov) => ()
+        case Right(v) => ()
+    }
 
   @cask.get("/stop/")
-  def stopServer(request: Request) = {
+  def stopServer(request: Request) =
     val s = space.size
+    println(f"contained $s atoms\n")
     actorContext.future(System.exit(0))
     f"contained $s atoms\n"
-  }
 
   initialize()
 }
