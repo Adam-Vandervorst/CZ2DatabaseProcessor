@@ -1,6 +1,9 @@
+import be.adamv.cz2
 import be.adamv.cz2.*
 import cask.*
 
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import scala.collection.mutable.ArrayBuffer
 
 
@@ -18,8 +21,13 @@ object DataParser extends Parser:
     else floats.addV(s.toFloat)
 
 object DataPrinter extends Printer:
-  val newVarString: String = "◆"
-  def preVarString(x: Long): String = "⏴" + subscript(-x.toInt)
+  private val options: Array[String] = "abcdefghijklmnopqrstuvwxyz".toArray.map(x => x.toString)
+  private val vcount = new ThreadLocal[Int]
+  def newVarString: String =
+    val c = vcount.get()
+    vcount.set(c + 1)
+    options(c)
+  def preVarString(x: Long): String = options(-x.toInt)
   def freeVarString(x: Long): String =
     DataParser.symbols.get(x.toInt)
       .orElse(DataParser.symbols.get(x.toInt))
@@ -29,6 +37,9 @@ object DataPrinter extends Printer:
   val exprSep: String = " "
   val exprOpen: String = "("
   val exprClose: String = ")"
+  override def sexpression(e: Expr, depth: Int = 0, colored: Boolean = false): String =
+    vcount.set(0)
+    super.sexpression(e, depth, colored)
 
 def parse_space(s: Iterable[Char]): ExprMap[Unit] =
   val result = ExprMap[Unit]()
@@ -40,10 +51,62 @@ def parse_space(s: Iterable[Char]): ExprMap[Unit] =
   result
 
 def stringify_space(em: EM[_]): String =
-  em.keys.map(DataPrinter.sexpression(_, 0, false)).mkString("\n")
+  em.keys.map(DataPrinter.sexpression(_)).mkString("\n")
 
 def parse_path(s: String): Seq[Option[Int]] =
   s.split('.').flatMap(x => Array(None, Some(DataParser.tokenizer(x).leftMost)))
+
+def stringify_path(p: Seq[Option[Int]]): String =
+  p.tail.map({case Some(i) => DataPrinter.freeVarString(i); case None => "."}).mkString
+
+type Path = Seq[Option[Int]]
+
+enum Action:
+  case Transform(source: Path, destination: Path, pattern: Expr, template: Expr)
+  case BinOp(left: Path, right: Path, destination: Path, op: "union" | "intersection" | "subtraction")
+
+  def serialize(bb: ArrayBuffer[Byte]): Unit = this match
+    case Action.Transform(source, destination, pattern, template) =>
+      bb.appendAll("transform".getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(stringify_path(source).getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(stringify_path(destination).getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(DataPrinter.sexpression(Expr(pattern, template)).getBytes)
+    case Action.BinOp(left, right, destination, op) =>
+      bb.appendAll(op.getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(stringify_path(left).getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(stringify_path(right).getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(stringify_path(destination).getBytes)
+      bb.append('/'.toByte)
+
+  def execute(space: ExprMap[Unit]): Unit = this match
+    case Action.Transform(source, destination, pattern, template) =>
+      space.getAt(source) match
+        case Left(em) =>
+          space.setAt(destination, em.transform(pattern, template).em, ???)
+        case Right(v) =>
+          space.setAt(destination, ???, v)
+    case Action.BinOp(left, right, destination, op) =>
+      space.getAt(left) match
+        case Left(em) =>
+          space.getAt(right) match
+            case Left(oem) =>
+              space.setAt(destination, (op match
+                case "union" => em.union(oem.asInstanceOf)
+                case "intersection" => em.intersection(oem.asInstanceOf).em
+                case "subtraction" => em.subtract(oem.asInstanceOf).em), ???)
+            case Right(ov) => ()
+        case Right(v) => ()
+
+  def permissions: Seq[(Path, Boolean)] = this match
+    case Action.Transform(source, destination, pattern, template) => Seq(source -> false, destination -> true)
+    case Action.BinOp(left, right, destination, op) => Seq(left -> false, right -> false, destination -> true)
+
 
 object Server extends cask.MainRoutes {
   private val space = ExprMap[Unit]()
@@ -68,12 +131,48 @@ object Server extends cask.MainRoutes {
       registry.filterInPlace((aid, p, w) => if aid != id then true else { println(f"cleared $p $w"); false })
     finally registry_lock.unlock()
   inline def locked[A](inline actions: (Seq[Option[Int]], Boolean)*)(inline body: => A): String =
-    val tid = Thread.currentThread().threadId()
+    val tid = Thread.currentThread().getId
     if register(tid, actions*) then
       try body.toString
       finally unregister(tid)
     else
       "conflicting reads at path"
+
+  private val event_stream = new FileOutputStream("event.log").getChannel
+  event_stream.force(true)
+  inline def writeBuf(inline serialization: => ArrayBuffer[Byte]): Int =
+    val buf = serialization
+    val lock = event_stream.lock()
+    event_stream.write(ByteBuffer.wrap(buf.toArray))
+    lock.release()
+    buf.length
+
+  inline def handleAction(inline request: cask.Request)(inline construction: => Action): String =
+    try
+      val action = construction
+      actorContext.future(locked(action.permissions*){
+        action.execute(space)
+        val bb = ArrayBuffer.empty[Byte]
+        val written = writeBuf {
+          bb.appendAll(request.exchange.getRequestId.getBytes)
+          bb.append('\n'.toByte)
+          bb
+        }
+        println(f"completed ${request.exchange.getRequestId} ($written bytes written) ${action}")
+      })
+      val bb = ArrayBuffer.empty[Byte]
+      val written = writeBuf {
+        bb.appendAll(System.currentTimeMillis().toString.getBytes)
+        bb.append(','.toByte)
+        bb.appendAll(request.exchange.getRequestId.getBytes)
+        bb.append(','.toByte)
+        action.serialize(bb)
+        bb.append('\n'.toByte)
+        bb
+      }
+      f"dispatched ${request.exchange.getRequestId} ($written bytes written) ${action}"
+    catch case e: Exception =>
+      s"invalid request ${e.getMessage}"
 
   @cask.post("/import/:destination")
   def importFile(request: cask.Request, destination: String) =
@@ -105,59 +204,28 @@ object Server extends cask.MainRoutes {
 
   @cask.post("/transform/:source/:destination")
   def transform(request: cask.Request, source: String, destination: String) =
-    val read_path = parse_path(source)
-    val write_path = parse_path(destination)
-    val App(pattern, template) = DataParser.sexpr(request.text().iterator).get: @unchecked
-
-    locked(read_path -> false, write_path -> true) {
-      space.getAt(read_path) match
-        case Left(em) =>
-          space.setAt(write_path, em.transform(pattern, template).em, ???)
-        case Right(v) =>
-          space.setAt(write_path, ???, v)
+    handleAction(request) {
+      DataParser.sexpr(request.text().iterator).get match
+        case Expr.Var(v) => throw RuntimeException(s"expected an expression of the form (<pattern> <template>) and got $v")
+        case Expr.App(pattern, template) => Action.Transform(parse_path(source), parse_path(destination), pattern, template)
     }
 
-  @cask.get("/union_into/:left/:right/:destination")
-  def unionInto(request: cask.Request, left: String, right: String, destination: String) =
-    val read_left_path = parse_path(left)
-    val read_right_path = parse_path(right)
-    val write_path = parse_path(destination)
-    locked(read_left_path -> false, read_right_path -> false, write_path -> true) {
-      space.getAt(read_left_path) match
-        case Left(em) =>
-          space.getAt(read_right_path) match
-            case Left(oem) =>
-              space.setAt(write_path, em.union(oem.asInstanceOf), ???)
-            case Right(ov) => ()
-        case Right(v) => ()
+  @cask.get("/union/:left/:right/:destination")
+  def union(request: cask.Request, left: String, right: String, destination: String) =
+    handleAction(request) {
+      Action.BinOp(parse_path(left), parse_path(right), parse_path(destination), "union")
     }
 
-  @cask.get("/intersection_into/:left/:right/:destination")
-  def intersectionInto(request: cask.Request, left: String, right: String, destination: String) =
-    val read_left_path = parse_path(left)
-    val read_right_path = parse_path(right)
-    val write_path = parse_path(destination)
-    locked(read_left_path -> false, read_right_path -> false, write_path -> true) {
-      space.getAt(read_left_path) match
-        case Left(em) => space.getAt(read_right_path) match
-          case Left(oem) =>
-            space.setAt(write_path, em.intersection(oem.asInstanceOf).em, ???)
-          case Right(ov) => ()
-        case Right(v) => ()
+  @cask.get("/intersection/:left/:right/:destination")
+  def intersection(request: cask.Request, left: String, right: String, destination: String) =
+    handleAction(request) {
+      Action.BinOp(parse_path(left), parse_path(right), parse_path(destination), "intersection")
     }
 
-  @cask.get("/subtraction_from/:left/:right/:destination")
-  def subtractionFrom(request: cask.Request, left: String, right: String, destination: String) =
-    val read_left_path = parse_path(left)
-    val read_right_path = parse_path(right)
-    val write_path = parse_path(destination)
-    locked(read_left_path -> false, read_right_path -> false, write_path -> true) {
-      space.getAt(read_left_path) match
-        case Left(em) => space.getAt(read_right_path) match
-          case Left(oem) =>
-            space.setAt(write_path, oem.subtract(em.asInstanceOf).em, ???)
-          case Right(ov) => ()
-        case Right(v) => ()
+  @cask.get("/subtraction/:left/:right/:destination")
+  def subtraction(request: cask.Request, left: String, right: String, destination: String) =
+    handleAction(request) {
+      Action.BinOp(parse_path(left), parse_path(right), parse_path(destination), "subtraction")
     }
 
   @cask.get("/stop/")
@@ -184,8 +252,10 @@ curl -i -X POST localhost:8081/import/aunt-kg.toy -d "@toy.metta"
 curl localhost:8081/export/aunt-kg.toy
 curl -i -X POST localhost:8081/import/aunt-kg.simpsons -d "@simpsons_simple.metta"
 curl -i -X POST localhost:8081/import/aunt-kg.lotr -d "@lordOfTheRings_simple.metta"
-curl localhost:8081/union_into/aunt-kg.lotr/aunt-kg.simpsons/genealogy.merged
-curl localhost:8081/union_into/aunt-kg.toy/genealogy.merged/genealogy.merged
-curl localhost:8081/export/genealogy.merged
+curl localhost:8081/union/aunt-kg.lotr/aunt-kg.simpsons/genealogy.merged
+curl localhost:8081/union/aunt-kg.toy/genealogy.merged/genealogy.merged
+curl localhost:8081/transform/genealogy.merged/genealogy.child-augmented/ -d "((parent \$x \$y) (child \$y \$x))"
+curl localhost:8081/union/genealogy.merged/genealogy.child-augmented/genealogy.augmented
+curl localhost:8081/export/genealogy.augmented > augmented.metta
 curl localhost:8081/stop
 */
