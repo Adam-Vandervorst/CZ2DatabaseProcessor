@@ -1,10 +1,13 @@
-import be.adamv.cz2
 import be.adamv.cz2.*
 import cask.*
 
-import java.io.FileOutputStream
+import java.io.{FileOutputStream, FileWriter}
+import java.net.URI
 import java.nio.ByteBuffer
+import java.nio.file.Files
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.Await
+import scala.concurrent.duration.Duration
 
 
 object DataParser extends Parser:
@@ -64,6 +67,8 @@ type Path = Seq[Option[Int]]
 enum Action:
   case Transform(source: Path, destination: Path, pattern: Expr, template: Expr)
   case BinOp(left: Path, right: Path, destination: Path, op: "union" | "intersection" | "subtraction")
+  case ImportFile(destination: Path, scheme: "http" | "https" | "file", filetype: "metta" | "json" | "jsonl", filename: String, uri: URI)
+  case ExportFile(source: Path, scheme: "http" | "https" | "file", filetype: "metta" | "json", filename: String)
 
   def serialize(bb: ArrayBuffer[Byte]): Unit = this match
     case Action.Transform(source, destination, pattern, template) =>
@@ -82,6 +87,24 @@ enum Action:
       bb.appendAll(stringify_path(right).getBytes)
       bb.append('/'.toByte)
       bb.appendAll(stringify_path(destination).getBytes)
+      bb.append('/'.toByte)
+    case ImportFile(destination, scheme, filetype, filename, uri) =>
+      bb.appendAll("import".getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(stringify_path(destination).getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(uri.toString.getBytes)
+      bb.append('/'.toByte)
+    case ExportFile(source, scheme, filetype, filename) =>
+      bb.appendAll("import".getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(stringify_path(source).getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(scheme.toString.getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(filetype.toString.getBytes)
+      bb.append('/'.toByte)
+      bb.appendAll(filename.toString.getBytes)
       bb.append('/'.toByte)
 
   def execute(space: ExprMap[Unit]): Unit = this match
@@ -102,10 +125,58 @@ enum Action:
                 case "subtraction" => em.subtract(oem.asInstanceOf).em), ???)
             case Right(ov) => ()
         case Right(v) => ()
+    case ImportFile(destination, scheme, filetype, filename, uri) =>
+      scheme match
+        case "http" | "https" =>
+          filetype match
+            case "metta" =>
+              val response = requests.get.apply(uri.toURL.toString)
+              val string = response.text()
+              val future = Server.actorContext.future({
+                val filepath = java.nio.file.Paths.get(s"resources/imports/metta/${stringify_path(destination).replace('.', '/')}/${filename}")
+                filepath.getParent.toFile.mkdirs()
+                Files.write(filepath, string.getBytes)
+              })
+              val subspace = parse_space(string)
+              space.setAt(destination, subspace.em, ???)
+              Await.result(future, Duration.Inf)
+            case format => throw RuntimeException(f"format ${format} not supported yet (${this})")
+        case "file" =>
+          filetype match
+            case "metta" =>
+              val src_filepath = java.nio.file.Paths.get(uri.getPath)
+              val future = Server.actorContext.future({
+                val filepath = java.nio.file.Paths.get(s"resources/imports/metta/${stringify_path(destination).replace('.', '/')}/${filename}")
+                filepath.getParent.toFile.mkdirs()
+                Files.copy(src_filepath, filepath)
+              })
+              val string = Files.readString(src_filepath)
+              val subspace = parse_space(string)
+              space.setAt(destination, subspace.em, ???)
+              Await.result(future, Duration.Inf)
+            case format => throw RuntimeException(f"format ${format} not supported yet (${this})")
+    case ExportFile(source, scheme, filetype, filename) =>
+      scheme match
+        case "http" =>
+          filetype match
+            case "metta" =>
+              space.getAt(source) match
+                case Left(em) =>
+                  val s = em.size
+                  val result = stringify_space(em)
+                  println(s"serialized ${s} from path ${source}")
+                  Files.write(java.nio.file.Paths.get(s"resources/exports/metta/${stringify_path(source).replace('.', '/')}/${filename}"), result.getBytes)
+                case Right(v) =>
+                  val result = v.toString
+                  Files.write(java.nio.file.Paths.get(s"resources/exports/metta/${stringify_path(source).replace('.', '/')}/${filename}"), result.getBytes)
+            case format => throw RuntimeException(f"format ${format} not supported yet (${this})")
+        case scheme => throw RuntimeException(f"scheme ${scheme} not supported yet (${this})")
 
   def permissions: Seq[(Path, Boolean)] = this match
-    case Action.Transform(source, destination, pattern, template) => Seq(source -> false, destination -> true)
-    case Action.BinOp(left, right, destination, op) => Seq(left -> false, right -> false, destination -> true)
+    case Action.Transform(source, destination, _, _) => Seq(source -> false, destination -> true)
+    case Action.BinOp(left, right, destination, _) => Seq(left -> false, right -> false, destination -> true)
+    case Action.ImportFile(destination, _, _, _, _) => Seq(destination -> true)
+    case Action.ExportFile(source, _, _, _) => Seq(source -> false)
 
 
 object Server extends cask.MainRoutes {
@@ -174,8 +245,8 @@ object Server extends cask.MainRoutes {
     catch case e: Exception =>
       s"invalid request ${e.getMessage}"
 
-  @cask.post("/import/:destination")
-  def importFile(request: cask.Request, destination: String) =
+  @cask.post("/modify/:destination")
+  def modify(request: cask.Request, destination: String) =
     val write_path = parse_path(destination)
     val subspace = parse_space(request.text())
     println(s"request destination ${destination} (${write_path.mkString("::")}::Nil) ${write_path.map(_.map(DataPrinter.freeVarString(_)))}")
@@ -187,8 +258,8 @@ object Server extends cask.MainRoutes {
       println(s"and wrote ${s} to path ${destination}")
     }
 
-  @cask.get("/export/:source")
-  def exportFile(request: cask.Request, source: String) =
+  @cask.get("/view/:source")
+  def view(request: cask.Request, source: String) =
     val read_path = parse_path(source)
     locked(read_path -> false) {
       space.getAt(read_path) match
@@ -201,6 +272,33 @@ object Server extends cask.MainRoutes {
           result
         case Right(v) => v.toString
     }
+
+  @cask.get("/import/:destination")
+  def importFile(request: cask.Request, destination: String, params: cask.QueryParams) =
+    handleAction(request) {
+      val uris = params.value("uri").head
+      val uri = URI(uris)
+      uri.getScheme match
+        case "https" | "http" =>
+          assert(Set("raw.githubusercontent.com", "localhost").contains(uri.getHost))
+        case "file" => ()
+      val filename = uris.splitAt(uris.lastIndexOf("/") + 1)._2
+      val extension = filename.splitAt(filename.lastIndexOf(".") + 1)._2
+      assert(Set("metta").contains(extension))
+      Action.ImportFile(parse_path(destination), uri.getScheme.asInstanceOf, extension.asInstanceOf, filename, uri)
+    }
+
+  @cask.get("/export/:source/:scheme/:filename")
+  def exportFile(request: cask.Request, source: String, scheme: String, filename: String) =
+    handleAction(request) {
+      val extension = filename.splitAt(filename.lastIndexOf(".") + 1)._2
+      assert(Set("metta").contains(extension))
+      assert(Set("file", "http").contains(scheme))
+      Action.ExportFile(parse_path(source), extension.asInstanceOf, extension.asInstanceOf, filename)
+    }
+
+  @cask.staticFiles("/static/metta/")
+  def staticFileMeTTa() = "resources/exports/metta"
 
   @cask.post("/transform/:source/:destination")
   def transform(request: cask.Request, source: String, destination: String) =
@@ -248,10 +346,10 @@ sbt> project root
 sbt> run
 
 testing API (when located in https://github.com/trueagi-io/metta-examples/tree/main/aunt-kg):
-curl -i -X POST localhost:8081/import/aunt-kg.toy -d "@toy.metta"
-curl localhost:8081/export/aunt-kg.toy
-curl -i -X POST localhost:8081/import/aunt-kg.simpsons -d "@simpsons_simple.metta"
-curl -i -X POST localhost:8081/import/aunt-kg.lotr -d "@lordOfTheRings_simple.metta"
+curl localhost:8081/import/aunt-kg.toy/?uri=https://raw.githubusercontent.com/trueagi-io/metta-examples/refs/heads/main/aunt-kg/toy.metta
+curl localhost:8081/view/aunt-kg.toy
+curl localhost:8081/import/aunt-kg.simpsons/?uri=https://raw.githubusercontent.com/trueagi-io/metta-examples/refs/heads/main/aunt-kg/simpsons_simple.metta
+curl localhost:8081/import/aunt-kg.lotr/?uri=https://raw.githubusercontent.com/trueagi-io/metta-examples/refs/heads/main/aunt-kg/lordOfTheRings_simple.metta
 curl localhost:8081/union/aunt-kg.lotr/aunt-kg.simpsons/genealogy.merged
 curl localhost:8081/union/aunt-kg.toy/genealogy.merged/genealogy.merged
 curl localhost:8081/transform/genealogy.merged/genealogy.child-augmented/ -d "((parent \$x \$y) (child \$y \$x))"

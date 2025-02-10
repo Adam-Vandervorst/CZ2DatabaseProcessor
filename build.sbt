@@ -13,12 +13,8 @@ lazy val root = crossProject(JVMPlatform).withoutSuffixFor(JVMPlatform)
   )
   .settings(
     name := "CZ2-DB",
-    libraryDependencies += "org.scalameta" %% "munit" % "1.0.0-M10" % Test,
+    libraryDependencies += "org.scalameta" %% "munit" % "1.1.0" % Test,
     libraryDependencies += "be.adamv" %% "cz2" % "0.2.17",
-    libraryDependencies += "com.lihaoyi" %% "cask" % "0.9.5",
-//    nativeConfig ~= {
-//      _.withLTO(LTO.full)
-//        .withMode(Mode.releaseFull)
-//        .withGC(GC.commix)
-//    }
+    libraryDependencies += "com.lihaoyi" %% "cask" % "0.10.2",
+    libraryDependencies += "com.lihaoyi" %% "requests" % "0.9.0"
 )
