@@ -5,6 +5,8 @@ import java.io.{FileOutputStream, FileWriter}
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.file.Files
+import java.time.Instant
+import java.util.Date
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.Await
 import scala.concurrent.duration.Duration
@@ -35,8 +37,8 @@ object DataPrinter extends Printer:
     DataParser.symbols.get(x.toInt)
       .orElse(DataParser.symbols.get(x.toInt))
       .orElse(DataParser.floats.get(x.toInt).map(_.toString))
-//      .orElse(DataParser.strings.get(x.toInt).map('"' + _ + '"'))
-      .orElse(DataParser.strings.get(x.toInt))
+      .orElse(DataParser.strings.get(x.toInt).map('"' + _ + '"'))
+//      .orElse(DataParser.strings.get(x.toInt))
       .getOrElse(x.toString)
   val exprSep: String = " "
   val exprOpen: String = "("
@@ -65,7 +67,7 @@ def stringify_path(p: Seq[Option[Int]]): String =
 
 def wrap(p: Seq[Option[Int]], e: Expr): Expr =
   var inner = e
-  for case (None, Some(i)) <- p.init.reverse zip p.reverse do 
+  for case (None, Some(i)) <- p.init.reverse zip p.reverse do
     inner = Expr.App(Expr.Var(i), inner)
   inner
 
@@ -175,6 +177,11 @@ enum Action:
 object Server extends cask.MainRoutes {
   private val space = ExprMap[Unit]()
   override def port: Int = 8081
+  
+  inline def instantExpr(): Expr =
+    val instant = Instant.now()
+    val discrim = (instant.getNano.toDouble/1_000_000_000.toDouble).toFloat
+    Expr(DataParser.symbols.addV("Instant"), DataParser.strings.addV(Date.from(instant).toString), DataParser.floats.addV(discrim))
 
   private val registry_lock = java.util.concurrent.locks.ReentrantLock()
   private val registry = ArrayBuffer[(Long, Seq[Option[Int]], Boolean)]()
@@ -218,7 +225,7 @@ object Server extends cask.MainRoutes {
         action.execute(space)
         val written = writeBuf {
           (DataPrinter.sexpression(
-            Expr(DataParser.floats.addV(System.currentTimeMillis()),
+            Expr(instantExpr(),
               DataParser.symbols.addV("completed"),
               DataParser.strings.addV(request.exchange.getRequestId))
           ) + '\n').getBytes
@@ -227,7 +234,7 @@ object Server extends cask.MainRoutes {
       })
       val written = writeBuf {
         (DataPrinter.sexpression(
-          Expr(DataParser.floats.addV(System.currentTimeMillis()),
+          Expr(instantExpr(),
                DataParser.symbols.addV("dispatched"),
                DataParser.strings.addV(request.exchange.getRequestId),
                action.serialized)
