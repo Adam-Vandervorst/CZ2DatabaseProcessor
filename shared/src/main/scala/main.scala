@@ -1,4 +1,4 @@
-import be.adamv.cz2.*
+import be.adamv.cz2.{Expr, *}
 import cask.*
 
 import java.io.{FileOutputStream, FileWriter}
@@ -35,6 +35,7 @@ object DataPrinter extends Printer:
     DataParser.symbols.get(x.toInt)
       .orElse(DataParser.symbols.get(x.toInt))
       .orElse(DataParser.floats.get(x.toInt).map(_.toString))
+//      .orElse(DataParser.strings.get(x.toInt).map('"' + _ + '"'))
       .orElse(DataParser.strings.get(x.toInt))
       .getOrElse(x.toString)
   val exprSep: String = " "
@@ -62,7 +63,14 @@ def parse_path(s: String): Seq[Option[Int]] =
 def stringify_path(p: Seq[Option[Int]]): String =
   p.tail.map({case Some(i) => DataPrinter.freeVarString(i); case None => "."}).mkString
 
+def wrap(p: Seq[Option[Int]], e: Expr): Expr =
+  var inner = e
+  for case (None, Some(i)) <- p.init.reverse zip p.reverse do 
+    inner = Expr.App(Expr.Var(i), inner)
+  inner
+
 type Path = Seq[Option[Int]]
+val `*` = DataParser.symbols.addV("star")
 
 enum Action:
   case Transform(source: Path, destination: Path, pattern: Expr, template: Expr)
@@ -70,42 +78,27 @@ enum Action:
   case ImportFile(destination: Path, scheme: "http" | "https" | "file", filetype: "metta" | "json" | "jsonl", filename: String, uri: URI)
   case ExportFile(source: Path, scheme: "http" | "https" | "file", filetype: "metta" | "json", filename: String)
 
-  def serialize(bb: ArrayBuffer[Byte]): Unit = this match
+  def serialized: Expr = this match
     case Action.Transform(source, destination, pattern, template) =>
-      bb.appendAll("transform".getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(stringify_path(source).getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(stringify_path(destination).getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(DataPrinter.sexpression(Expr(pattern, template)).getBytes)
+      Expr(DataParser.symbols.addV("transform"),
+           wrap(source, *),
+           wrap(destination, *),
+           Expr(pattern, template))
     case Action.BinOp(left, right, destination, op) =>
-      bb.appendAll(op.getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(stringify_path(left).getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(stringify_path(right).getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(stringify_path(destination).getBytes)
-      bb.append('/'.toByte)
+      Expr(DataParser.symbols.addV(op),
+        wrap(left, *),
+        wrap(right, *),
+        wrap(destination, *))
     case ImportFile(destination, scheme, filetype, filename, uri) =>
-      bb.appendAll("import".getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(stringify_path(destination).getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(uri.toString.getBytes)
-      bb.append('/'.toByte)
+      Expr(DataParser.symbols.addV("import"),
+        wrap(destination, *),
+        DataParser.strings.addV(uri.toString))
     case ExportFile(source, scheme, filetype, filename) =>
-      bb.appendAll("import".getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(stringify_path(source).getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(scheme.toString.getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(filetype.toString.getBytes)
-      bb.append('/'.toByte)
-      bb.appendAll(filename.toString.getBytes)
-      bb.append('/'.toByte)
+      Expr(DataParser.symbols.addV("export"),
+        wrap(source, *),
+        DataParser.strings.addV(scheme),
+        DataParser.strings.addV(filetype),
+        DataParser.strings.addV(filename))
 
   def execute(space: ExprMap[Unit]): Unit = this match
     case Action.Transform(source, destination, pattern, template) =>
@@ -209,12 +202,12 @@ object Server extends cask.MainRoutes {
     else
       "conflicting reads at path"
 
-  private val event_stream = new FileOutputStream("event.log").getChannel
+  private val event_stream = new FileOutputStream("events.metta").getChannel
   event_stream.force(true)
-  inline def writeBuf(inline serialization: => ArrayBuffer[Byte]): Int =
+  inline def writeBuf(inline serialization: => Array[Byte]): Int =
     val buf = serialization
     val lock = event_stream.lock()
-    event_stream.write(ByteBuffer.wrap(buf.toArray))
+    event_stream.write(ByteBuffer.wrap(buf))
     lock.release()
     buf.length
 
@@ -223,23 +216,22 @@ object Server extends cask.MainRoutes {
       val action = construction
       actorContext.future(locked(action.permissions*){
         action.execute(space)
-        val bb = ArrayBuffer.empty[Byte]
         val written = writeBuf {
-          bb.appendAll(request.exchange.getRequestId.getBytes)
-          bb.append('\n'.toByte)
-          bb
+          (DataPrinter.sexpression(
+            Expr(DataParser.floats.addV(System.currentTimeMillis()),
+              DataParser.symbols.addV("completed"),
+              DataParser.strings.addV(request.exchange.getRequestId))
+          ) + '\n').getBytes
         }
         println(f"completed ${request.exchange.getRequestId} ($written bytes written) ${action}")
       })
-      val bb = ArrayBuffer.empty[Byte]
       val written = writeBuf {
-        bb.appendAll(System.currentTimeMillis().toString.getBytes)
-        bb.append(','.toByte)
-        bb.appendAll(request.exchange.getRequestId.getBytes)
-        bb.append(','.toByte)
-        action.serialize(bb)
-        bb.append('\n'.toByte)
-        bb
+        (DataPrinter.sexpression(
+          Expr(DataParser.floats.addV(System.currentTimeMillis()),
+               DataParser.symbols.addV("dispatched"),
+               DataParser.strings.addV(request.exchange.getRequestId),
+               action.serialized)
+        ) + '\n').getBytes
       }
       f"dispatched ${request.exchange.getRequestId} ($written bytes written) ${action}"
     catch case e: Exception =>
@@ -337,6 +329,17 @@ object Server extends cask.MainRoutes {
 }
 
 /*
+
+
+curl localhost:8081/transform/edgar.imported/edgar.fuzzy-augmented/ -d "((FORM 3490 $company $formid $value) (signed $formid $date) (valuations $value $date $company))"
+curl localhost:8081/union/edgar.imported/edgar.fuzzy-augmented/finance.db
+curl -X POST localhost:8081/MORKL/queries.90431/
+locs = DropHead(S"locations" <| S"Europe")
+S"valuation" <| (interval(20_000_000, Inf) x interval(2006*year, 2007*year) x locs)
+curl localhost:8081/view/queries.90431
+25_000_000, April 2006, 23andMe Holding Co.
+...
+
 publishing cz2 (https://github.com/Adam-Vandervorst/CZ2):
 sbt> project root
 sbt> publishLocal
@@ -344,7 +347,7 @@ sbt> publishLocal
 starting server (this repo):
 sbt> project root
 sbt> run
-
+// todo evlog view
 testing API (when located in https://github.com/trueagi-io/metta-examples/tree/main/aunt-kg):
 curl localhost:8081/import/aunt-kg.toy/?uri=https://raw.githubusercontent.com/trueagi-io/metta-examples/refs/heads/main/aunt-kg/toy.metta
 curl localhost:8081/view/aunt-kg.toy
